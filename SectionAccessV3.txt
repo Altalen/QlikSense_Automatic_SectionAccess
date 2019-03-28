@@ -1,0 +1,370 @@
+// Script de création automatique d'une table de Section Access.
+// Benjamin FOURNET, société ACSSI.
+
+// ** CHANGELOG **
+
+// Version 3, édité le 13/02/19.
+//	-> Ajout du mode "Exclusion".
+//	Cela permet d'écrire des règles du type "Autoriser toutes les valeurs SAUF ...".
+//	La valeur (ou liste de valeurs) correspondantes doit être préfixée avec la chaîne de caratères définie ci-dessous par la variable "SA_PrefixeExclusions".
+//	Exemple : "[*-]b*;e*;s*"   -> signifie que l'utilisateur accède à toutes les valeurs SAUF celles commençant par les lettres "b", "e" et "s"
+
+// ********
+
+// Version 2, édité le 30/11/18.
+// 	-> Ajout de la gestion des caractères génériques.
+// 	Il est désormais possible d'utiliser les caractères génériques "*" et "?" pour désigner les valeurs autorisées, ce qui peut grandement simplifier l'écriture des régles.
+// 	Exemple : "88*" -> signifie que l'utilisateur accède à toutes les valeurs commençant par "88"
+
+// ********
+
+// Version 1, édité le 02/11/18.
+
+
+/*
+/!\ Remarque importante : ce script est conçu pour fonctionner avec UN SEUL champ de réduction.
+
+Pré-requis à la mise en place :
+    - Inclure à la fin du script de l'application le présent script de sécurité
+    - Que le modèle de données comporte le champ sur lequel effectuer la réduction (spécifié ci-dessous par la variable "SA_NomChampSecurite")
+    - Que les paramètres de la section configuration (ci-dessous) soient bien en adéquation avec le fichier Excel des droits
+*/
+
+
+// Etape 1 - Configuration
+
+// Nom de la connexion (LIB) vers le fichier Excel des droits
+SET SA_CheminExcelDroits = 'Scripts (carglass_bfournet-ext)';
+
+// Création d'une table Section Access visible dans le modèle pour auditer le résultat (0 = non, 1 = oui)
+SET SA_CreerTableVerification = 1;
+
+// Nom du champ sur lequel s'applique la réduction (sécurité). Ce nom doit être commun au fichier Excel ET au modèle de données.
+SET SA_NomChampSecurite = 'SECURITY_KEY';
+
+// Symbole utilisé pour représenter l'accés à toutes les valeurs
+SET SA_SymboleAll = '*';
+
+// Séparateur utilisé dans le cas des valeurs multiples
+SET SA_SeparateurValeurs = ';';
+
+// Préfixe pour identifier les valeurs à traiter en mode exclusion
+SET SA_PrefixeExclusions = '[*-]';
+
+
+// Etape 2 - Recherche de la présence du champ de réduction dans le modèle pour déterminer s'il faut créer une table d'accès étendue ou basique (sans réduction).
+
+FOR SA_Compteur = 0 to NoOfTables()-1
+	LET SA_NomTable = TableName($(SA_Compteur));
+	    
+	FOR SA_Compteur2 = 1 to NoOfFields(SA_NomTable)
+		LET SA_NomChamp = FieldName($(SA_Compteur2), SA_NomTable);
+			
+		If Match(SA_NomChamp, '$(SA_NomChampSecurite)') = 1 then
+		  	SA_TABLES_SYSTEME:
+		  	LOAD * INLINE [
+		    Table, Champ
+		    $(SA_NomTable), $(SA_NomChamp)
+			];
+		ENDIF
+	  NEXT;
+NEXT;
+
+If NoOfRows('SA_TABLES_SYSTEME') > 0 then
+	
+		SET SA_ChampSecurityValueDetecte = 1;
+		LET SA_NomTableValeurDroit = Peek('Table', 0);
+		DROP Table SA_TABLES_SYSTEME;
+        TRACE ## SECTION ACCESS : Champ de réduction identifié dans le modèle, création d une table d accès étendue.;
+		
+ELSE
+    	SET SA_ChampSecurityValueDetecte = 0;
+		TRACE ## SECTION ACCESS : Champ de réduction non identifié dans le modèle, création d une table d accès basique.;
+ENDIF
+
+
+// Etape 3 - Chargement des administrateurs permanents
+
+// Les utilisateurs se trouvant dans la feuille "Administrateurs" obtiennent automatiquement la valeur "ADMIN" pour la propriété "ACCESS".
+// Par conséquent, ils ont systématiquement accès à toutes les valeurs sur toutes les applications (pas de réduction).
+
+SA_TMP:
+LOAD Distinct
+	'ADMIN' as ACCESS,
+	Upper(Trim(DOMAIN)) & '\' & Upper(Trim(USER)) as USER,
+    '*' as $(SA_NomChampSecurite)
+FROM [lib://$(SA_CheminExcelDroits)/Droits.xlsx]
+(ooxml, embedded labels, table is Administrateurs)
+Where Trim(ENABLED) = 1
+AND Len(Trim(DOMAIN)) > 0
+AND Len(Trim(USER)) > 0;
+
+// Si un ou des administrateurs ont été identifiés alors ...
+IF NoOfRows('SA_TMP') > 0 then
+
+	TRACE ## SECTION ACCESS : Au moins un administrateur a été identifié.;
+
+	// ... on affecte le rôle "ADMIN" et la valeur de réduction "*" à ces administrateurs ...
+    IF SA_ChampSecurityValueDetecte = 1 then
+
+		SA_DROITS_APPLICATION:
+    	NoConcatenate Load
+      		ACCESS,
+      		USER as USER_VERIF,
+      		$(SA_NomChampSecurite)
+   		Resident SA_TMP;
+    
+    // ... sinon on charge ces administrateurs sans ajouter de colonne de réduction (mode table d'accès basique).
+	ELSE
+
+		SA_DROITS_APPLICATION:
+    	NoConcatenate Load
+      		ACCESS,
+      		USER as USER_VERIF
+   		Resident SA_TMP;
+
+	ENDIF
+    
+ELSE
+	TRACE ## SECTION ACCESS : Aucun administrateur n a été identifié.;
+ENDIF
+
+DROP Table SA_TMP;
+
+
+// Etape 4 - Chargement des utilisateurs ayant accés à toutes les valeurs
+
+// Les utilisateurs ayant accès à toutes les valeurs obtiennent automatiquement la valeur "ADMIN" pour la propriété "ACCESS".
+// Ceci permet d'insérer une seule ligne par utilisateur dans la table d'accès avec pour valeur de réduction "*".
+// Pour obtenir le même résultat en utilisant la valeur "USER", il faudrait charger une ligne par valeur de réduction et par utilisateur (moins optimal).
+
+SA_TMP:
+NoConcatenate
+LOAD Distinct
+	'ADMIN' as ACCESS, 
+	Upper(Trim(DOMAIN)) & '\' & Upper(Trim(USER)) as USER,
+    '*' as $(SA_NomChampSecurite),
+    Upper(Trim(SubField(OMIT, '$(SA_SeparateurValeurs)'))) as OMIT
+FROM [lib://$(SA_CheminExcelDroits)/Droits.xlsx]
+(ooxml, embedded labels, table is Utilisateurs)
+Where Trim(ENABLED) = 1
+AND Len(Trim(ACCESS)) > 0
+AND Len(Trim(DOMAIN)) > 0
+AND Len(Trim(USER)) > 0
+AND Match(Trim(APPNAME), DocumentTitle())
+AND Match(Trim($(SA_NomChampSecurite)), '$(SA_SymboleAll)')
+AND not Exists(USER_VERIF, Upper(Trim(DOMAIN)) & '\' & Upper(Trim(USER)));
+
+// Si un ou des utilisateurs ayant accés à toutes les valeurs ont été identifiés alors ...
+IF NoOfRows('SA_TMP') > 0 then
+
+	TRACE ## SECTION ACCESS : Au moins un utilisateur ayant accès à l ensemble des valeurs a été identifié.;
+
+	// ... on affecte le rôle "ADMIN" et la valeur de réduction "*" à ces utilisateurs ...
+	IF SA_ChampSecurityValueDetecte = 1 then
+    
+    	Concatenate(SA_DROITS_APPLICATION)
+        LOAD Distinct
+        	ACCESS,
+            USER as USER_VERIF,
+			$(SA_NomChampSecurite)
+		Resident SA_TMP;
+	
+	// ... sinon on charge ces utilisateurs sans ajouter de colonne de réduction (mode table d'accès basique).
+	ELSE
+		
+        Concatenate(SA_DROITS_APPLICATION)
+        LOAD Distinct
+        	ACCESS,
+            USER as USER_VERIF
+		Resident SA_TMP;
+	
+	ENDIF
+    
+    //Enfin on ajoute les règles pour les colonnes masquées (OMIT) s'il y en a.
+    Concatenate(SA_DROITS_APPLICATION)
+	LOAD Distinct
+       	ACCESS,
+		USER as USER_VERIF,
+        OMIT
+	Resident SA_TMP
+    Where Not IsNull(OMIT);
+ELSE
+	TRACE ## SECTION ACCESS : Aucun utilisateur ayant accès à l ensemble des valeurs n a été identifié.;
+ENDIF
+
+DROP TABLE SA_TMP;
+
+
+// Etape 5 - Chargement des utilisateurs ayant un accès restreint aux valeurs
+
+SA_TMP:
+NoConcatenate
+LOAD Distinct
+	Upper(Trim(ACCESS)) as ACCESS, 
+	Upper(Trim(DOMAIN)) & '\' & Upper(Trim(USER)) as USER,
+    Upper(Trim(SubField(Replace($(SA_NomChampSecurite), '$(SA_PrefixeExclusions)', ''), '$(SA_SeparateurValeurs)'))) as $(SA_NomChampSecurite)_TMP,
+    If(Left(Trim($(SA_NomChampSecurite)), Len('$(SA_PrefixeExclusions)')) = '$(SA_PrefixeExclusions)', 1, 0) as FlagValeursExclusion,
+    Upper(Trim(SubField(OMIT, '$(SA_SeparateurValeurs)'))) as OMIT
+FROM [lib://$(SA_CheminExcelDroits)/Droits.xlsx]
+(ooxml, embedded labels, table is Utilisateurs)
+Where Trim(ENABLED) = 1
+AND Len(Trim(ACCESS)) > 0
+AND Len(Trim(DOMAIN)) > 0
+AND Len(Trim(USER)) > 0
+AND Match(Trim(APPNAME), DocumentTitle())
+AND not Match(Trim($(SA_NomChampSecurite)), '$(SA_SymboleAll)')
+AND not Exists(USER_VERIF, Upper(Trim(DOMAIN)) & '\' & Upper(Trim(USER)));
+
+// Si un ou des utilisateurs ayant un accès restreint aux valeurs ont été identifiés alors ...
+IF NoOfRows('SA_TMP') > 0 Then
+
+	TRACE ## SECTION ACCESS : Au moins un utilisateur ayant un accès restreint aux valeurs a été identifié.;
+	
+    // ... on affecte la ou les valeurs de réduction corespondantes à ces utilisateurs tout en s'assurant qu'elles existent bien dans le modèle...
+	IF SA_ChampSecurityValueDetecte = 1 then
+    
+    	Join(SA_TMP)
+		LOAD DISTINCT
+        	$(SA_NomChampSecurite)
+		Resident $(SA_NomTableValeurDroit);
+        
+        
+        // Cas des inclusions
+        Concatenate(SA_DROITS_APPLICATION)
+		LOAD Distinct
+			ACCESS, 
+			USER as USER_VERIF,
+			$(SA_NomChampSecurite)
+		Resident SA_TMP
+		Where 
+     	FlagValeursExclusion = 0
+        and WildMatch($(SA_NomChampSecurite), $(SA_NomChampSecurite)_TMP);
+        
+        
+        // Cas des exclusions
+        EXCLUSIONS:
+        LOAD DISTINCT
+			AutoNumberHash256(ACCESS, USER, $(SA_NomChampSecurite)) as CleValeursExclusion
+        Resident SA_TMP
+        Where FlagValeursExclusion = 1
+        and WildMatch($(SA_NomChampSecurite), $(SA_NomChampSecurite)_TMP);
+        
+        Concatenate(SA_DROITS_APPLICATION)
+		LOAD Distinct
+			ACCESS, 
+			USER as USER_VERIF,
+			$(SA_NomChampSecurite)
+		Resident SA_TMP
+		Where
+		FlagValeursExclusion = 1
+        and not Exists(CleValeursExclusion, AutoNumberHash256(ACCESS, USER, $(SA_NomChampSecurite)));
+        
+        DROP Table EXCLUSIONS;
+        
+    
+    // ... sinon on charge ces utilisateurs sans ajouter de colonne de réduction (mode table d'accès basique).
+    ELSE
+    
+    	Concatenate(SA_DROITS_APPLICATION)
+        LOAD Distinct
+        	ACCESS,
+            USER as USER_VERIF
+		Resident SA_TMP;
+    
+    ENDIF
+    
+    // Enfin on ajoute les règles pour les colonnes masquées (OMIT) s'il y en a.
+    Concatenate(SA_DROITS_APPLICATION)
+	LOAD Distinct
+       	ACCESS,
+		USER as USER_VERIF,
+        OMIT
+	Resident SA_TMP
+    Where Not IsNull(OMIT);
+
+ELSE
+	TRACE ## SECTION ACCESS : Aucun utilisateur ayant un accès restreint aux valeurs n a été identifié.;
+ENDIF
+
+DROP Table SA_TMP;
+
+
+//Etape 6 - Création de la table de Section Access finale
+
+Section Access;
+
+IF SA_ChampSecurityValueDetecte = 1 THEN
+
+	NoConcatenate 
+	LOAD Distinct
+		ACCESS,
+		USER_VERIF as USERID,
+		$(SA_NomChampSecurite),
+        OMIT
+	Resident SA_DROITS_APPLICATION;
+
+ELSE
+
+	NoConcatenate 
+	LOAD Distinct
+		ACCESS,
+		USER_VERIF as USERID,
+        OMIT
+	Resident SA_DROITS_APPLICATION;
+
+ENDIF
+
+SECTION Application;
+
+
+// Etape 7 - FACULTATIF, conserver une copie visible du Section Access à des fins de contrôle
+
+
+If SA_CreerTableVerification = 1 Then
+
+	TRACE ## SECTION ACCESS : Création d une table d audit pour le section access.;
+    Qualify *;
+	
+    IF SA_ChampSecurityValueDetecte = 1 Then
+    
+		SA_AUDIT:
+		LOAD Distinct
+			ACCESS,
+			USER_VERIF as USERID,
+			$(SA_NomChampSecurite),
+        	OMIT
+		Resident SA_DROITS_APPLICATION;
+        
+	ELSE
+    
+    	SA_AUDIT:
+		LOAD Distinct
+			ACCESS,
+			USER_VERIF as USERID,
+        	OMIT
+		Resident SA_DROITS_APPLICATION;
+        
+	ENDIF
+    
+    Unqualify *;
+    
+ENDIF
+
+
+
+// Etape 8 - Nettoyage
+
+Drop table SA_DROITS_APPLICATION;
+LET SA_CheminExcelDroits = Null();
+LET SA_CreerTableVerification = Null();
+LET SA_NomChampSecurite = Null();
+LET SA_SymboleAll = Null();
+LET SA_SeparateurValeurs = Null();
+LET SA_PrefixeExclusions = Null();
+LET SA_ChampSecurityValueDetecte = Null();
+LET SA_Compteur = Null();
+LET SA_Compteur2 = Null();
+LET SA_NomTable = Null();
+LET SA_NomChamp = Null();
+LET SA_NomTableValeurDroit = Null();
